@@ -1,241 +1,198 @@
-# Extract_frame
-# UrbanVideo-Bench 抽帧与多模态 SFT 数据构建脚本
+# UrbanVideo-Bench 视频问答数据预处理与 Qwen3-VL 评估流程
 
-本项目包含两个 Python 脚本，用于将 UrbanVideo-Bench 视频数据处理成适合 Qwen3-VL / Unsloth 训练的多模态 SFT 数据。
+本项目用于将 UrbanVideo-Bench 原始视频问答数据整理为适合 **Qwen3-VL / Unsloth Studio** 进行多模态监督微调的数据格式，并提供训练后模型的验证集准确率评估脚本。
 
-## 文件说明
-
-| 文件名                              | 功能                                                         |
-| ----------------------------------- | ------------------------------------------------------------ |
-| `extract_uniform_frames.py`         | 对视频进行均匀抽帧，将每个视频保存为若干张 JPG 图片。        |
-| `build_urbanvideo_frames_16_sft.py` | 读取抽帧结果和 `MCQ.parquet` 问答文件，生成 ChatML 风格的多模态 SFT JSONL 文件。 |
-
-整体处理流程如下：
+整体流程如下：
 
 ```text
 原始视频 videos/
         ↓
 extract_uniform_frames.py
         ↓
-抽帧图片 frames_16/
+均匀抽帧 frames_16/
         ↓
 build_urbanvideo_frames_16_sft.py
         ↓
-urbanvideo_frames_16_sft.jsonl
+多模态 SFT 数据 urbanvideo_frames_16_sft.jsonl
+        ↓
+split_train_val.py
+        ↓
+train.jsonl / val.jsonl
+        ↓
+Unsloth Studio 微调 Qwen3-VL
+        ↓
+eval_qwen3vl_accuracy.py
+        ↓
+验证集准确率评估
 ```
 
 ---
 
-## 环境依赖
+## 1. 文件说明
 
-建议使用 Python 3.10 及以上版本。
+| 文件名                              | 作用                                                         |
+| ----------------------------------- | ------------------------------------------------------------ |
+| `extract_uniform_frames.py`         | 从原始视频中均匀抽取固定数量的关键帧，并保存为图片序列。     |
+| `build_urbanvideo_frames_16_sft.py` | 将视频关键帧、问题文本和答案标签构造成 Qwen3-VL 可用的多模态 ChatML / SFT JSONL 数据。 |
+| `split_train_val.py`                | 将生成的 JSONL 数据随机划分为训练集和验证集。                |
+| `eval_qwen3vl_accuracy.py`          | 加载 Unsloth Studio 训练后的 LoRA 模型，并在验证集上计算选择题准确率。 |
 
-安装依赖：
+---
+
+## 2. 数据对齐关系说明
+
+本数据集不是传统图像分类任务，而是**视频多模态问答任务**。
+
+每条样本的对齐关系为：
+
+```text
+video_id 对应的视频抽帧文件夹
+        +
+question 中的问题文本和候选选项
+        ↓
+answer 中的正确选项字母
+```
+
+具体来说：
+
+```text
+frames_16/{video_id}/frame_000.jpg
+frames_16/{video_id}/frame_001.jpg
+...
+frames_16/{video_id}/frame_015.jpg
+        +
+question
+        ↓
+answer，例如 A / B / C / D / E / F / G
+```
+
+因此，模型训练目标是：
+
+```text
+输入：同一视频的多帧关键帧 + 问题文本 + 候选选项
+输出：正确选项字母
+```
+
+---
+
+## 3. 环境依赖
+
+建议在 Ubuntu 环境下运行。常用依赖如下：
 
 ```bash
-pip install opencv-python numpy tqdm pandas pyarrow
+pip install opencv-python numpy pandas pyarrow tqdm
 ```
 
-依赖说明：
+如果需要运行训练后评估脚本，还需要安装：
 
-| 依赖            | 作用                                   |
-| --------------- | -------------------------------------- |
-| `opencv-python` | 读取视频并保存图片。                   |
-| `numpy`         | 生成均匀抽帧的帧编号。                 |
-| `tqdm`          | 显示处理进度条。                       |
-| `pandas`        | 读取 `MCQ.parquet` 问答文件。          |
-| `pyarrow`       | 让 `pandas` 支持读取 `.parquet` 文件。 |
+```bash
+pip install torch transformers peft
+```
+
+如果使用 Unsloth Studio 的虚拟环境，建议先激活：
+
+```bash
+source /home/zhang-hr/.unsloth/studio/unsloth_studio/bin/activate
+```
 
 ---
 
-## 一、视频均匀抽帧：`extract_uniform_frames.py`
+## 4. 第一步：均匀抽取视频关键帧
 
-### 1. 脚本作用
+脚本：
 
-该脚本会扫描视频目录中的视频文件，并对每个视频均匀抽取固定数量的帧。
-
-默认情况下，每个视频抽取 16 帧，并保存到：
-
-```text
-/home/zhang-hr/big_model/datasets/UrbanVideo-Bench/frames_16/
+```bash
+extract_uniform_frames.py
 ```
 
-每个视频会生成一个同名文件夹，例如：
+该脚本会从原始视频目录中读取视频文件，并为每个视频均匀抽取 `NUM_FRAMES` 张关键帧。
 
-```text
-frames_16/
-├── EmbodiedCity_1/
-│   ├── frame_000.jpg
-│   ├── frame_001.jpg
-│   ├── ...
-│   └── frame_015.jpg
-├── EmbodiedCity_2/
-│   ├── frame_000.jpg
-│   └── ...
-```
-
-### 2. 修改抽帧数量
-
-在 `extract_uniform_frames.py` 中找到：
+默认配置：
 
 ```python
 NUM_FRAMES = 16
-```
 
-如果你想每个视频抽取 8 帧，改成：
-
-```python
-NUM_FRAMES = 8
-```
-
-如果你想每个视频抽取 24 帧，改成：
-
-```python
-NUM_FRAMES = 24
-```
-
-修改后，输出目录会自动变成：
-
-```text
-frames_8/
-frames_24/
-```
-
-因为代码中输出路径写的是：
-
-```python
-output_root = Path(f"/home/zhang-hr/big_model/datasets/UrbanVideo-Bench/frames_{NUM_FRAMES}")
-```
-
-### 3. 修改视频输入路径
-
-在 `extract_uniform_frames.py` 中找到：
-
-```python
 video_root = Path("/home/zhang-hr/big_model/datasets/UrbanVideo-Bench/videos")
-```
 
-这里表示原始视频所在目录。
-
-例如，如果你的视频放在：
-
-```text
-/home/zhang-hr/data/my_videos
-```
-
-就改成：
-
-```python
-video_root = Path("/home/zhang-hr/data/my_videos")
-```
-
-注意：Linux 绝对路径前面要有 `/`。
-
-### 4. 修改抽帧输出路径
-
-在 `extract_uniform_frames.py` 中找到：
-
-```python
 output_root = Path(f"/home/zhang-hr/big_model/datasets/UrbanVideo-Bench/frames_{NUM_FRAMES}")
 ```
 
-这里表示抽帧图片保存目录。
-
-例如，如果你想保存到：
-
-```text
-/home/zhang-hr/data/video_frames_16
-```
-
-可以改成：
-
-```python
-output_root = Path("/home/zhang-hr/data/video_frames_16")
-```
-
-或者仍然保留自动根据抽帧数量命名的方式：
-
-```python
-output_root = Path(f"/home/zhang-hr/data/frames_{NUM_FRAMES}")
-```
-
-### 5. 运行抽帧脚本
-
-进入脚本所在目录：
-
-```bash
-cd /home/zhang-hr/PycharmProjects/extract_frames
-```
-
-运行：
+运行命令：
 
 ```bash
 python extract_uniform_frames.py
 ```
 
-运行成功后，终端会输出类似：
+运行后会生成类似目录：
 
 ```text
-视频目录: /home/zhang-hr/big_model/datasets/UrbanVideo-Bench/videos
-输出目录: /home/zhang-hr/big_model/datasets/UrbanVideo-Bench/frames_16
-抽帧数量: 每个视频 16 帧
-找到视频数量: 1392
-
-抽帧完成
-成功视频数: 1392
-失败视频数: 0
-抽帧结果保存到: /home/zhang-hr/big_model/datasets/UrbanVideo-Bench/frames_16
+UrbanVideo-Bench/
+├── videos/
+│   ├── xxx.mp4
+│   └── ...
+└── frames_16/
+    ├── xxx/
+    │   ├── frame_000.jpg
+    │   ├── frame_001.jpg
+    │   ├── ...
+    │   └── frame_015.jpg
+    └── ...
 ```
 
-### 6. 支持的视频格式
-
-脚本默认会搜索以下视频格式：
-
-```python
-["*.mp4", "*.avi", "*.mov", "*.mkv", "*.webm"]
-```
-
-如果你的视频是其他格式，例如 `.flv`，可以在代码中添加：
-
-```python
-for ext in ["*.mp4", "*.avi", "*.mov", "*.mkv", "*.webm", "*.flv"]:
-    video_files.extend(video_root.rglob(ext))
-```
-
-### 7. 注意事项
-
-如果某个视频已经抽过帧，并且输出目录中已有足够数量的 `frame_*.jpg`，脚本会自动跳过该视频，避免重复处理。
-
-如果你修改了 `NUM_FRAMES`，建议使用新的输出目录，例如：
+脚本支持的视频格式包括：
 
 ```text
-frames_8/
-frames_16/
-frames_24/
+.mp4 / .avi / .mov / .mkv / .webm
 ```
 
-不要把不同抽帧数量的结果混在同一个文件夹中。
+如果某个视频已经完成抽帧，脚本会自动跳过，避免重复处理。
 
 ---
 
-## 二、生成多模态 SFT JSONL：`build_urbanvideo_frames_16_sft.py`
+## 5. 第二步：构建 Qwen3-VL 多模态 SFT 数据
 
-### 1. 脚本作用
+脚本：
 
-该脚本读取：
+```bash
+build_urbanvideo_frames_16_sft.py
+```
+
+该脚本会读取：
 
 ```text
 MCQ.parquet
 frames_16/
 ```
 
-然后生成多模态训练用的 JSONL 文件：
+然后根据 `video_id` 找到对应的视频帧文件夹，将多张图片、问题文本和答案标签构造成 Qwen3-VL / Unsloth 可用的多模态 SFT JSONL 文件。
+
+默认配置：
+
+```python
+ROOT = Path("/home/zhang-hr/big_model/datasets/UrbanVideo-Bench")
+
+MCQ_PATH = ROOT / "MCQ.parquet"
+
+NUM_FRAMES = 16
+
+FRAMES_ROOT = ROOT / f"frames_{NUM_FRAMES}"
+
+OUT_PATH = ROOT / f"urbanvideo_frames_{NUM_FRAMES}_sft.jsonl"
+```
+
+运行命令：
+
+```bash
+python build_urbanvideo_frames_16_sft.py
+```
+
+生成文件：
 
 ```text
 urbanvideo_frames_16_sft.jsonl
 ```
 
-每一行是一个训练样本，格式大致如下：
+每一行是一条训练样本，格式类似：
 
 ```json
 {
@@ -245,312 +202,380 @@ urbanvideo_frames_16_sft.jsonl
       "content": [
         {"type": "image", "image": "/path/to/frame_000.jpg"},
         {"type": "image", "image": "/path/to/frame_001.jpg"},
-        {"type": "text", "text": "问题文本"}
+        {"type": "text", "text": "以下 16 张图片来自同一段视频..."}
       ]
     },
     {
       "role": "assistant",
       "content": [
-        {"type": "text", "text": "B"}
+        {"type": "text", "text": "D"}
       ]
     }
   ]
 }
 ```
 
-该格式可用于 Qwen3-VL / Unsloth 的多模态 SFT 训练。
+其中：
 
-### 2. 修改数据集根目录
+- `image`：视频关键帧路径；
+- `text`：问题文本和提示词；
+- `assistant` 中的 `text`：监督标签，即正确选项字母。
 
-在 `build_urbanvideo_frames_16_sft.py` 中找到：
+---
 
-```python
-ROOT = Path("/home/zhang-hr/big_model/datasets/UrbanVideo-Bench")
-```
+## 6. 第三步：划分训练集和验证集
 
-这里表示 UrbanVideo-Bench 数据集根目录。
-
-该目录下应包含：
-
-```text
-UrbanVideo-Bench/
-├── MCQ.parquet
-├── frames_16/
-```
-
-如果你的数据集放在其他位置，例如：
-
-```text
-/home/zhang-hr/data/UrbanVideo-Bench
-```
-
-就改成：
-
-```python
-ROOT = Path("/home/zhang-hr/data/UrbanVideo-Bench")
-```
-
-### 3. 修改问答文件路径
-
-默认问答文件路径是：
-
-```python
-MCQ_PATH = ROOT / "MCQ.parquet"
-```
-
-也就是说，脚本默认会读取：
-
-```text
-/home/zhang-hr/big_model/datasets/UrbanVideo-Bench/MCQ.parquet
-```
-
-如果你的问答文件名字不同，例如：
-
-```text
-train.parquet
-```
-
-可以改成：
-
-```python
-MCQ_PATH = ROOT / "train.parquet"
-```
-
-### 4. 修改抽帧数量
-
-在 `build_urbanvideo_frames_16_sft.py` 中找到：
-
-```python
-NUM_FRAMES = 16
-```
-
-这里的数字必须和抽帧脚本中的 `NUM_FRAMES` 保持一致。
-
-例如：
-
-如果你在 `extract_uniform_frames.py` 中设置：
-
-```python
-NUM_FRAMES = 24
-```
-
-那么这里也要改成：
-
-```python
-NUM_FRAMES = 24
-```
-
-否则脚本会去找：
-
-```text
-frames_16/
-```
-
-而不是：
-
-```text
-frames_24/
-```
-
-### 5. 修改抽帧目录
-
-默认抽帧目录是：
-
-```python
-FRAMES_ROOT = ROOT / f"frames_{NUM_FRAMES}"
-```
-
-也就是说，如果 `NUM_FRAMES = 16`，脚本会读取：
-
-```text
-UrbanVideo-Bench/frames_16/
-```
-
-如果你的抽帧图片不在这个目录，而是在：
-
-```text
-/home/zhang-hr/data/my_frames
-```
-
-可以直接改成：
-
-```python
-FRAMES_ROOT = Path("/home/zhang-hr/data/my_frames")
-```
-
-### 6. 修改输出 JSONL 路径
-
-默认输出路径是：
-
-```python
-OUT_PATH = ROOT / f"urbanvideo_frames_{NUM_FRAMES}_sft.jsonl"
-```
-
-如果 `NUM_FRAMES = 16`，输出文件为：
-
-```text
-urbanvideo_frames_16_sft.jsonl
-```
-
-如果你想自定义输出路径，例如：
-
-```text
-/home/zhang-hr/data/urbanvideo_train.jsonl
-```
-
-可以改成：
-
-```python
-OUT_PATH = Path("/home/zhang-hr/data/urbanvideo_train.jsonl")
-```
-
-### 7. 运行 JSONL 生成脚本
-
-进入脚本目录：
+脚本：
 
 ```bash
-cd /home/zhang-hr/PycharmProjects/extract_frames
+split_train_val.py
 ```
 
-运行：
-
-```bash
-python build_urbanvideo_frames_16_sft.py
-```
-
-运行成功后，终端会输出类似：
+该脚本会将生成的 JSONL 文件随机划分为：
 
 ```text
-读取问答文件: /home/zhang-hr/big_model/datasets/UrbanVideo-Bench/MCQ.parquet
-抽帧目录: /home/zhang-hr/big_model/datasets/UrbanVideo-Bench/frames_16
-输出文件: /home/zhang-hr/big_model/datasets/UrbanVideo-Bench/urbanvideo_frames_16_sft.jsonl
-原始问答样本数: 5348
+train.jsonl
+val.jsonl
+```
 
-生成完成
-成功写入样本数: 5348
-缺少抽帧的样本数: 0
-帧数不足 16 的样本数: 0
+默认划分比例：
+
+```python
+val_ratio = 0.1
+```
+
+即：
+
+```text
+90% 训练集
+10% 验证集
+```
+
+默认路径：
+
+```python
+src_path = "/home/zhang-hr/big_model/datasets/urbanvideo_hf_upload/urbanvideo_frames_16_sft_relative.jsonl"
+```
+
+使用前需要根据自己的实际数据路径修改 `src_path`。例如：
+
+```python
+src_path = "/home/zhang-hr/big_model/datasets/UrbanVideo-Bench/urbanvideo_frames_16_sft.jsonl"
+```
+
+运行命令：
+
+```bash
+python split_train_val.py
+```
+
+输出示例：
+
+```text
+划分完成
+原始样本数: 5348
+训练集样本数: 4814
+验证集样本数: 534
+训练集保存到: train.jsonl
+验证集保存到: val.jsonl
 ```
 
 ---
 
-## 三、如果要上传到 Hugging Face，建议改成相对路径
+## 7. 第四步：导入 Unsloth Studio 训练
 
-当前 `build_urbanvideo_frames_16_sft.py` 中生成图片路径时使用了：
-
-```python
-frame_paths = [str(p.resolve()) for p in frame_paths]
-```
-
-这会生成绝对路径，例如：
+在 Unsloth Studio 中选择本地数据集：
 
 ```text
-/home/zhang-hr/big_model/datasets/UrbanVideo-Bench/frames_16/EmbodiedCity_1/frame_000.jpg
+train.jsonl
 ```
 
-如果只在本机训练，这样没问题。
-
-但如果要上传到 Hugging Face，建议改成相对路径，例如：
+如果有验证集入口，可以同时选择：
 
 ```text
-frames_16/EmbodiedCity_1/frame_000.jpg
+val.jsonl
 ```
 
-可以将这一行：
-
-```python
-frame_paths = [str(p.resolve()) for p in frame_paths]
-```
-
-改成：
-
-```python
-frame_paths = [str(p.relative_to(ROOT)) for p in frame_paths]
-```
-
-前提是 `FRAMES_ROOT` 在 `ROOT` 目录内部，例如：
+推荐训练模型：
 
 ```text
-ROOT/frames_16/
+unsloth/Qwen3-VL-4B-Instruct-unsloth-bnb-4bit
 ```
 
-修改后生成的 JSONL 更适合上传到 Hugging Face 数据集仓库。
+推荐初始参数：
+
+```text
+Method: QLoRA
+Batch Size: 1
+Gradient Accumulation: 8
+Learning Rate: 5e-5
+LoRA Rank: 16
+LoRA Alpha: 32
+LoRA Dropout: 0.05
+Max Steps: 1000 - 3000
+Context Length: 2048 或 4096
+Optimizer: Paged AdamW 8-bit
+Scheduler: Cosine
+```
+
+如果显存压力较大，可以优先降低：
+
+```text
+Context Length
+LoRA Rank
+输入帧数
+```
 
 ---
 
-## 四、常见修改示例
+## 8. 第五步：评估训练后模型准确率
 
-### 示例 1：每个视频抽取 8 帧
+脚本：
 
-两个脚本都修改：
+```bash
+eval_qwen3vl_accuracy.py
+```
+
+该脚本用于加载 Unsloth Studio 输出的模型目录，并在验证集上计算选择题准确率。
+
+该评估脚本支持：
+
+- 加载基础模型；
+- 加载 LoRA adapter；
+- 支持 A-G 选项答案提取；
+- 每条样本限制最大图片数；
+- `max_new_tokens=1`，只生成一个答案字母；
+- `use_cache=False`，降低推理显存压力；
+- 自动清理每条样本的 GPU 缓存；
+- 遇到 CUDA OOM 时跳过该样本并继续评估。
+
+运行前建议设置：
+
+```bash
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+```
+
+示例命令：
+
+```bash
+source /home/zhang-hr/.unsloth/studio/unsloth_studio/bin/activate
+
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+
+MODEL_DIR=/home/zhang-hr/.unsloth/studio/outputs/unsloth_Qwen3-VL-4B-Instruct-unsloth-bnb-4bit_1783041665
+
+python eval_qwen3vl_accuracy.py \
+  --model_dir "$MODEL_DIR" \
+  --val_path /home/zhang-hr/big_model/datasets/urbanvideo_frame_16/val_abs.jsonl \
+  --max_images 16 \
+  --max_new_tokens 1
+```
+
+如果只想快速测试前 20 条：
+
+```bash
+python eval_qwen3vl_accuracy.py \
+  --model_dir "$MODEL_DIR" \
+  --val_path /home/zhang-hr/big_model/datasets/urbanvideo_frame_16/val_abs.jsonl \
+  --max_samples 20 \
+  --max_images 16 \
+  --max_new_tokens 1
+```
+
+如果出现显存不足，可以改为只使用前 8 张图评估：
+
+```bash
+python eval_qwen3vl_accuracy.py \
+  --model_dir "$MODEL_DIR" \
+  --val_path /home/zhang-hr/big_model/datasets/urbanvideo_frame_16/val_abs.jsonl \
+  --max_images 8 \
+  --max_new_tokens 1
+```
+
+---
+
+## 9. 当前实验结果示例
+
+当前模型在自行划分的验证集上得到：
+
+```text
+有效评估样本数: 534
+答对数量: 185
+准确率: 0.3464
+准确率百分比: 34.64%
+标准答案无效数: 0
+模型输出无法提取 A/B/C/D/E 的数量: 0
+OOM 跳过样本数: 0
+```
+
+该结果高于随机猜测和多数类基线，说明模型经过微调后已经学到一定的视频问答规律，但仍有较大提升空间。
+
+---
+
+## 10. 后续优化建议
+
+### 10.1 重新生成 8 帧或 12 帧版本
+
+当前 16 帧输入可能导致 token 数过长。建议尝试：
 
 ```python
 NUM_FRAMES = 8
 ```
 
-然后重新运行：
+或：
+
+```python
+NUM_FRAMES = 12
+```
+
+重新执行：
 
 ```bash
 python extract_uniform_frames.py
 python build_urbanvideo_frames_16_sft.py
+python split_train_val.py
 ```
 
-最终会得到：
+注意：如果修改帧数，建议同步修改脚本文件名和输出目录，例如：
 
 ```text
 frames_8/
 urbanvideo_frames_8_sft.jsonl
 ```
 
-### 示例 2：每个视频抽取 24 帧
+---
 
-两个脚本都修改：
+### 10.2 将提示词改为英文
 
-```python
-NUM_FRAMES = 24
-```
-
-然后重新运行：
-
-```bash
-python extract_uniform_frames.py
-python build_urbanvideo_frames_16_sft.py
-```
-
-最终会得到：
+如果原始问题和选项为英文，建议将提示词也改为英文，例如：
 
 ```text
-frames_24/
-urbanvideo_frames_24_sft.jsonl
-```
-
-### 示例 3：更换数据集路径
-
-如果你的数据集目录是：
-
-```text
-/home/zhang-hr/data/UrbanVideo-Bench
-```
-
-抽帧脚本中修改：
-
-```python
-video_root = Path("/home/zhang-hr/data/UrbanVideo-Bench/videos")
-output_root = Path(f"/home/zhang-hr/data/UrbanVideo-Bench/frames_{NUM_FRAMES}")
-```
-
-JSONL 生成脚本中修改：
-
-```python
-ROOT = Path("/home/zhang-hr/data/UrbanVideo-Bench")
-MCQ_PATH = ROOT / "MCQ.parquet"
-FRAMES_ROOT = ROOT / f"frames_{NUM_FRAMES}"
-OUT_PATH = ROOT / f"urbanvideo_frames_{NUM_FRAMES}_sft.jsonl"
+The following {N} images are uniformly sampled frames from the same video in chronological order.
+Treat them as a video frame sequence.
+Answer the multiple-choice question based on the frames.
+Only output the correct option letter from the available choices, such as A, B, C, D, E, F, or G.
+Do not explain.
 ```
 
 ---
 
+### 10.3 按 video_id 分组划分数据集
 
+如果同一个 `video_id` 对应多个问题，建议后续按照 `video_id` 分组划分训练集、验证集和测试集，避免同一视频同时出现在训练集和验证集中。
 
+更规范的划分方式为：
 
+```text
+train: 80%
+val: 10%
+test: 10%
+```
 
+并保证：
+
+```text
+同一个 video_id 的所有问答样本只出现在一个数据子集中
+```
+
+---
+
+### 10.4 建立原始模型 baseline
+
+建议使用同一验证集评估原始 Qwen3-VL-4B-Instruct 模型，得到：
+
+```text
+原始模型准确率
+微调后模型准确率
+```
+
+这样才能判断微调带来的真实提升幅度。
+
+---
+
+## 11. 注意事项
+
+### 11.1 当前结果不是官方测试集结果
+
+如果原始数据没有提供官方训练集、验证集、测试集划分，则当前结果应表述为：
+
+```text
+自行划分验证集上的阶段性准确率
+```
+
+不要表述为：
+
+```text
+测试集准确率
+```
+
+---
+
+### 11.2 A-G 都是合法答案
+
+当前数据中答案标签范围覆盖：
+
+```text
+A / B / C / D / E / F / G
+```
+
+因此评估脚本不能只支持 A-E，否则会把 F/G 样本误判为无效标准答案。
+
+---
+
+### 11.3 16 帧输入可能过长
+
+评估时部分样本的输入长度可能超过 4000 甚至 10000 token。若训练时 Context Length 设置为 2048，可能会产生训练和评估输入长度不一致的问题。建议后续优先尝试 8 帧或 12 帧版本。
+
+---
+
+## 12. 推荐运行顺序汇总
+
+```bash
+# 1. 抽取视频关键帧
+python extract_uniform_frames.py
+
+# 2. 构造多模态 SFT JSONL
+python build_urbanvideo_frames_16_sft.py
+
+# 3. 划分训练集和验证集
+python split_train_val.py
+
+# 4. 在 Unsloth Studio 中导入 train.jsonl 进行 QLoRA 微调
+
+# 5. 评估微调后模型
+source /home/zhang-hr/.unsloth/studio/unsloth_studio/bin/activate
+
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+
+MODEL_DIR=/home/zhang-hr/.unsloth/studio/outputs/your_model_output_dir
+
+python eval_qwen3vl_accuracy.py \
+  --model_dir "$MODEL_DIR" \
+  --val_path /path/to/val_abs.jsonl \
+  --max_images 16 \
+  --max_new_tokens 1
+```
+
+---
+
+## 13. 目录结构示例
+
+推荐项目结构：
+
+```text
+UrbanVideo-Qwen3VL/
+├── extract_uniform_frames.py
+├── build_urbanvideo_frames_16_sft.py
+├── split_train_val.py
+├── eval_qwen3vl_accuracy.py
+├── README.md
+└── data/
+    ├── videos/
+    ├── frames_16/
+    ├── MCQ.parquet
+    ├── urbanvideo_frames_16_sft.jsonl
+    ├── train.jsonl
+    └── val.jsonl
+```
+
+大型视频、抽帧图片和 JSONL 数据不建议上传到 GitHub，建议上传到 Hugging Face Dataset 或云盘。
